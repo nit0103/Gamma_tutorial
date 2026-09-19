@@ -1,0 +1,312 @@
+FILE LOCATION, DEM, ORBIT, IW2, 4-5 BURST, VV KE LIYE
+
+
+
+#!/bin/bash
+# ============================================================================
+# MOONIDIH COLLIERY — Sentinel-1A ASCENDING — GAMMA processing
+# Subswath IW2, Burst 4-5 ONLY (study area crop)
+# ALL POSSIBLE PAIRS (3 dates -> 3 pairs) up to PHASE UNWRAPPING
+#
+# Data used (as seen in your screenshots):
+#   SLC zips : G:\PhD_Nitish\Moonidih\Moonidih_work\Sentinel gamma\S1A_ASC\
+#   Orbits   : G:\PhD_Nitish\Moonidih\Moonidih_work\Sentinel gamma\ORBIT\
+#   DEM      : G:\PhD_Nitish\Moonidih\Moonidih_work\Sentinel gamma\DEM\
+#
+# Run this from a bash shell where your G: drive is mounted as /g
+# (if your mount point is different, e.g. /mnt/g, change PROJ below)
+# ============================================================================
+
+set -e   # PURPOSE: script turant ruk jaaye agar koi bhi command fail ho jaaye
+         # (isse ek step ka error aage chal kar "silent corruption" nahi banega)
+
+# ---------------------------------------------------------------------------
+# 0. PROJECT PATHS  — INPUT: apne folders ka exact location
+# ---------------------------------------------------------------------------
+PROJ="/g/PhD_Nitish/Moonidih/Moonidih_work/Sentinel gamma"
+S1_DIR="$PROJ/S1A_ASC"          # raw Sentinel-1 SLC .zip yahan hain
+ORBIT_DIR="$PROJ/ORBIT"         # precise orbit .EOF files yahan hain
+DEM_SRC_DIR="$PROJ/DEM"         # aapka ISCE-format WGS84 DEM yahan hai
+WORK="$PROJ/GAMMA_processing"   # OUTPUT: naya working folder — sab kuch yahan banega
+                                 # (raw data ko touch/modify nahi karenge)
+
+mkdir -p "$WORK"/{DEM,SLC,SLC_subset,RSLC,mli,diff,logs}
+
+# ---------------------------------------------------------------------------
+# 1. DATE / FILE MAPPING — INPUT: 3 acquisitions, apni exact filenames se
+# ---------------------------------------------------------------------------
+# PURPOSE: har date ko uski zip file aur uski CORRECT (matching) orbit file se
+# jodna. Orbit file ka validity window (V..._...) acquisition date ko cover
+# karta hai — ye maine aapke ORBIT folder ke screenshot se date-match kiya hai.
+
+declare -A ZIP
+ZIP[20250110]="S1A_IW_SLC__1SDV_20250110T122115_20250110T122142_057382_07100D_B788.zip"
+ZIP[20250122]="S1A_IW_SLC__1SDV_20250122T122114_20250122T122141_057557_0716FE_734A.zip"
+ZIP[20250203]="S1A_IW_SLC__1SDV_20250203T122114_20250203T122141_057732_071DEE_864D.zip"
+
+declare -A ORBIT
+ORBIT[20250110]="S1A_OPER_AUX_POEORB_OPOD_20250130T070638_V20250109T225942_20250111T005942.EOF"
+ORBIT[20250122]="S1A_OPER_AUX_POEORB_OPOD_20250211T070640_V20250121T225942_20250123T005942.EOF"
+ORBIT[20250203]="S1A_OPER_AUX_POEORB_OPOD_20250223T070603_V20250202T225942_20250204T005942.EOF"
+
+DATES=(20250110 20250122 20250203)
+
+# Reference (super-master) scene:
+# PURPOSE: har secondary scene isi ke saath coregister hoga. Beech waali date
+# (20250122) ko reference banaya hai taaki dono taraf temporal baseline
+# symmetric/kam rahe (10-Jan se 12 din, 22-Jan se 12 din) — coregistration
+# aur coherence dono ke liye behtar hai.
+REF=20250122
+
+# Study-area crop — sirf IW2, burst 4 aur 5
+IW=2
+BURST_FIRST=4
+BURST_LAST=5
+
+# Multi-look factors (range x azimuth) — pure script mein consistent rakhna
+RLKS=5
+AZLKS=1
+
+# ---------------------------------------------------------------------------
+# HELPER: ek 1-line SLC_tab file se slc/par/tops_par path nikalna
+# ---------------------------------------------------------------------------
+# PURPOSE: GAMMA ke coregistration/mosaic tools khud tab files ke andar
+# output filenames likhte hain — hum unhe guess karne ke bajaye seedha
+# tab file se PADH lenge, taaki filename-mismatch se koi error na aaye.
+read_tab() {
+    read -r TAB_SLC TAB_PAR TAB_TOPS < "$1"
+}
+
+# ---------------------------------------------------------------------------
+# 2. DEM PREPARATION
+# ---------------------------------------------------------------------------
+# INPUT : $DEM_SRC_DIR/moonidih.dem.wgs84.vrt  (aapka existing ISCE-format DEM)
+# OUTPUT: $WORK/DEM/moonidih.dem , moonidih.dem_par  (GAMMA native format)
+# PURPOSE: GAMMA ke coregistration/simulation/geocoding tools (dem_import,
+#          S1_coreg_TOPS, phase_sim_orb) ko DEM apne khud ke binary format
+#          (.dem + .dem_par) mein chahiye, ISCE ke .wgs84 format mein nahi.
+#          Isliye pehle GeoTIFF banate hain (gdal_translate), phir GAMMA
+#          format mein import karte hain (dem_import).
+
+gdal_translate -of GTiff \
+    "$DEM_SRC_DIR/moonidih.dem.wgs84.vrt" \
+    "$WORK/DEM/moonidih_dem.tif"
+
+dem_import "$WORK/DEM/moonidih_dem.tif" \
+    "$WORK/DEM/moonidih.dem" \
+    "$WORK/DEM/moonidih.dem_par" \
+    0 1 - - 0
+# arguments: input_DEM  output_DEM  output_DEM_par  input_type(0=GeoTIFF)
+#            geoid_flag(1=subtract EGM geoid) ... (baaki defaults)
+
+# ---------------------------------------------------------------------------
+# 3. IMPORT EACH SCENE — SIRF IW2 (poori subswath, bursts baad mein katenge)
+# ---------------------------------------------------------------------------
+# INPUT : $S1_DIR/<zip file>, matching orbit .EOF, polarization VV, subswath 2
+# OUTPUT: $WORK/SLC/<date>/<date>.IW2.slc / .slc.par / .tops_par
+# PURPOSE: par_S1_SLC Sentinel-1 SAFE(.zip) ko GAMMA SLC format mein convert
+#          karta hai, aur precise orbit (.EOF) se satellite position/velocity
+#          correct karta hai. .tops_par file burst-by-burst timing rakhti hai
+#          (agle step mein burst 4-5 select karne ke liye zaroori hai).
+# NOTE: agar aapko VH polarization bhi chahiye, isi command mein "VV" ko "VH"
+#       kar ke dubara chalao — alag output file banega.
+
+for d in "${DATES[@]}"; do
+    mkdir -p "$WORK/SLC/$d"
+    echo ">>> Importing $d (IW${IW}) ..."
+    par_S1_SLC "$S1_DIR/${ZIP[$d]}" VV $IW \
+        "$WORK/SLC/$d/${d}.IW${IW}.slc.par" \
+        "$WORK/SLC/$d/${d}.IW${IW}.slc" \
+        "$WORK/SLC/$d/${d}.IW${IW}.tops_par" \
+        "$ORBIT_DIR/${ORBIT[$d]}" \
+        > "$WORK/logs/import_${d}.log" 2>&1
+done
+
+# ---------------------------------------------------------------------------
+# 4. PER-DATE SLC_tab (sirf IW2 hai, isliye 1 line ki tab file)
+# ---------------------------------------------------------------------------
+# OUTPUT: $WORK/SLC/<date>_IW2_tab
+# PURPOSE: GAMMA ke TOPS scripts (SLC_copy_S1_TOPS, S1_coreg_TOPS) ko teeno
+#          files (slc, slc.par, tops_par) ek "tab" file ke through diye
+#          jaate hain — ek line = ek subswath. Hamare case mein sirf IW2
+#          hai, isliye har tab file mein sirf 1 line hai.
+
+for d in "${DATES[@]}"; do
+    echo "$WORK/SLC/$d/${d}.IW${IW}.slc $WORK/SLC/$d/${d}.IW${IW}.slc.par $WORK/SLC/$d/${d}.IW${IW}.tops_par" \
+        > "$WORK/SLC/${d}_IW2_tab"
+done
+
+# ---------------------------------------------------------------------------
+# 5. BURST SUBSETTING — sirf burst 4-5 nikalna (study area crop)
+# ---------------------------------------------------------------------------
+# INPUT : burst_tab (1 line, kyunki 1 hi swath hai) = "4 5"
+# OUTPUT: $WORK/SLC_subset/<date>/<date>.IW2.slc (chhota, sirf 2 burst)
+# PURPOSE: Poora IW2 subswath process karne ki zarurat nahi — sirf wahi
+#          bursts nikalte hain jinme study area (Moonidih) padta hai. Isse
+#          processing time aur disk space dono kaafi kam ho jaate hain.
+
+echo "${BURST_FIRST} ${BURST_LAST}" > "$WORK/burst_tab_IW2"
+
+for d in "${DATES[@]}"; do
+    mkdir -p "$WORK/SLC_subset/$d"
+    echo "$WORK/SLC_subset/$d/${d}.IW${IW}.slc $WORK/SLC_subset/$d/${d}.IW${IW}.slc.par $WORK/SLC_subset/$d/${d}.IW${IW}.tops_par" \
+        > "$WORK/SLC_subset/${d}_IW2_tab"
+
+    echo ">>> Extracting burst ${BURST_FIRST}-${BURST_LAST} for $d ..."
+    SLC_copy_S1_TOPS "$WORK/SLC/${d}_IW2_tab" \
+        "$WORK/SLC_subset/${d}_IW2_tab" \
+        "$WORK/burst_tab_IW2" \
+        > "$WORK/logs/burstcopy_${d}.log" 2>&1
+done
+
+# ---------------------------------------------------------------------------
+# 6. REFERENCE SCENE — mosaic bursts + Multi-look image (MLI)
+# ---------------------------------------------------------------------------
+# INPUT : $WORK/SLC_subset/${REF}_IW2_tab
+# OUTPUT: $WORK/RSLC/${REF}.rslc / .rslc.par   (reference ka apna mosaic —
+#         iske saath hi baaki sab dates compare/differenced honge)
+#         $WORK/mli/${REF}.mli / .mli.par      (averaged intensity, reference
+#         geometry/width ke liye)
+# PURPOSE: reference scene ko khud ke saath coregister karne ki zarurat nahi
+#          hoti — bas uske do burst (4,5) ko ek continuous image mein
+#          "mosaic" karna hota hai. Ye hi image aage har secondary scene ka
+#          coregistration target banega.
+
+SLC_mosaic_S1_TOPS "$WORK/SLC_subset/${REF}_IW2_tab" \
+    "$WORK/RSLC/${REF}.rslc" \
+    "$WORK/RSLC/${REF}.rslc.par" \
+    $RLKS $AZLKS \
+    > "$WORK/logs/mosaic_ref.log" 2>&1
+
+multi_S1_TOPS "$WORK/SLC_subset/${REF}_IW2_tab" \
+    "$WORK/mli/${REF}.mli" \
+    "$WORK/mli/${REF}.mli.par" \
+    $RLKS $AZLKS \
+    > "$WORK/logs/mli_ref.log" 2>&1
+
+# range_samples nikal lo — aage har command mein <width> ki jagah ye use hoga
+WIDTH=$(grep range_samples "$WORK/mli/${REF}.mli.par" | awk '{print $2}')
+echo ">>> Reference MLI width = $WIDTH pixels"
+
+# ---------------------------------------------------------------------------
+# 7. COREGISTRATION — har secondary date ko REF ke saath align karna
+# ---------------------------------------------------------------------------
+# INPUT : reference tab+ID, secondary tab+ID, DEM (Step 2 ka output)
+# OUTPUT: $WORK/RSLC/<date>.RSLC_tab  (+ andar likhe .rslc/.rslc.par/.tops_par)
+# PURPOSE: S1_coreg_TOPS DEM-simulation se initial offsets nikalta hai, phir
+#          precise resampling + Enhanced Spectral Diversity (ESD) se burst
+#          overlap ko align karta hai — ye TOPS data ke liye zaroori hai,
+#          warna interferogram mein phase jump aa jaata hai.
+# NOTE: neeche ka argument order GAMMA ke common version ke hisaab se hai.
+#       Agar error aaye "wrong number of arguments", ek baar terminal mein
+#       sirf "S1_coreg_TOPS" likh ke Enter dabao — apne installed version ka
+#       exact usage/order dikhega, usse match kar lena.
+
+for d in "${DATES[@]}"; do
+    if [ "$d" != "$REF" ]; then
+        echo ">>> Coregistering $d -> reference $REF ..."
+        S1_coreg_TOPS "$WORK/SLC_subset/${REF}_IW2_tab" $REF \
+            "$WORK/SLC_subset/${d}_IW2_tab" $d \
+            "$WORK/RSLC/${d}.RSLC_tab" \
+            "$WORK/DEM/moonidih.dem" "$WORK/DEM/moonidih.dem_par" \
+            - - 1 1 0.8 - - \
+            > "$WORK/logs/coreg_${d}.log" 2>&1
+    fi
+done
+
+# Reference ke liye bhi ek matching tab file bana do, taaki agle step ka
+# loop REF aur secondaries ko ek hi tarah (uniformly) handle kar sake.
+echo "$WORK/RSLC/${REF}.rslc $WORK/RSLC/${REF}.rslc.par -" > "$WORK/RSLC/${REF}.RSLC_tab"
+
+# ---------------------------------------------------------------------------
+# 8. ALL POSSIBLE PAIRS — 3 dates => C(3,2) = 3 unique pairs
+# ---------------------------------------------------------------------------
+# PURPOSE: SBAS-style network banane ke liye sirf reference-secondary pairs
+#          nahi, balki har date-pair ka differential interferogram banate
+#          hain. Kyunki sab RSLC ek hi reference geometry mein resample ho
+#          chuke hain (Step 7), koi bhi do RSLC ko difference karna valid hai.
+
+PAIRS=()
+for ((i=0; i<${#DATES[@]}; i++)); do
+    for ((j=i+1; j<${#DATES[@]}; j++)); do
+        PAIRS+=("${DATES[$i]}_${DATES[$j]}")
+    done
+done
+echo ">>> Pairs to process: ${PAIRS[@]}"
+
+# ---------------------------------------------------------------------------
+# 9. LOOP: DIFFERENTIAL INTERFEROGRAM -> ADAPTIVE FILTER -> COHERENCE MASK
+#          -> PHASE UNWRAPPING   (har pair ke liye)
+# ---------------------------------------------------------------------------
+for pair in "${PAIRS[@]}"; do
+    ref_d=${pair%_*}
+    sec_d=${pair#*_}
+    pairdir="$WORK/diff/${pair}"
+    mkdir -p "$pairdir"
+    echo "=================================================="
+    echo ">>> Processing pair: $ref_d - $sec_d"
+    echo "=================================================="
+
+    read_tab "$WORK/RSLC/${ref_d}.RSLC_tab"
+    REF_SLC=$TAB_SLC; REF_PAR=$TAB_PAR
+    read_tab "$WORK/RSLC/${sec_d}.RSLC_tab"
+    SEC_SLC=$TAB_SLC; SEC_PAR=$TAB_PAR
+
+    # -- (a) Simulated unwrapped phase from DEM (orbit geometry se) --
+    # INPUT : dono RSLC.par files + DEM (Step 2)
+    # OUTPUT: $pairdir/sim_unw
+    # PURPOSE: topography ke wajah se hone wale phase ko simulate karna,
+    #          jise agle step mein actual SLC phase se ghatana hai
+    #          (differential interferogram ka core idea).
+    phase_sim_orb "$REF_PAR" "$SEC_PAR" \
+        - "$WORK/DEM/moonidih.dem_par" "$WORK/DEM/moonidih.dem" \
+        "$pairdir/sim_unw" \
+        "$REF_PAR" \
+        > "$WORK/logs/simunw_${pair}.log" 2>&1
+
+    # -- (b) Differential interferogram --
+    # OUTPUT: $pairdir/${pair}.diff  (raw, unfiltered wrapped phase)
+    # PURPOSE: reference aur secondary RSLC ka complex conjugate multiply,
+    #          minus topographic simulated phase = deformation + noise
+    #          wala wrapped interferogram.
+    SLC_diff_intf "$REF_SLC" "$SEC_SLC" \
+        "$REF_PAR" "$SEC_PAR" \
+        - "$pairdir/sim_unw" \
+        "$pairdir/${pair}.diff" $RLKS $AZLKS \
+        > "$WORK/logs/diff_${pair}.log" 2>&1
+
+    # -- (c) Adaptive filtering + coherence --
+    # OUTPUT: $pairdir/${pair}.diff.adf (filtered/smooth phase)
+    #         $pairdir/${pair}.cc       (coherence, 0-1 range)
+    # PURPOSE: phase noise kam karna aur pixel-wise reliability (coherence)
+    #          nikalna — dono agle (unwrapping) step ke liye zaroori hain.
+    adf "$pairdir/${pair}.diff" "$pairdir/${pair}.diff.adf" \
+        "$pairdir/${pair}.cc" "$WIDTH" 0.4 32 \
+        > "$WORK/logs/adf_${pair}.log" 2>&1
+
+    # -- (d) Coherence-based mask --
+    # OUTPUT: $pairdir/${pair}.mask.bmp
+    # PURPOSE: 0.3 se kam coherence wale (unreliable) pixels ko unwrapping
+    #          se exclude karna, taaki galat unwrap na ho.
+    rascc_mask "$pairdir/${pair}.cc" "$WORK/mli/${REF}.mli" "$WIDTH" \
+        1 1 0 1 1 0.3 - - - - - "$pairdir/${pair}.mask.bmp" \
+        > "$WORK/logs/mask_${pair}.log" 2>&1
+
+    # -- (e) Phase unwrapping --
+    # OUTPUT: $pairdir/${pair}.unw   <-- FINAL PRODUCT (isse displacement
+    #         calculate hoga: LOS displacement = unw_phase * wavelength / 4*pi)
+    # PURPOSE: wrapped (-pi to +pi) phase ko continuous, absolute phase mein
+    #          convert karna — deformation quantify karne ke liye zaroori.
+    mcf "$pairdir/${pair}.diff.adf" "$pairdir/${pair}.cc" \
+        "$pairdir/${pair}.mask.bmp" "$pairdir/${pair}.unw" \
+        "$WIDTH" 1 0 0 - - 1 1 \
+        > "$WORK/logs/unwrap_${pair}.log" 2>&1
+
+    echo ">>> DONE: $pairdir/${pair}.unw"
+done
+
+echo "=================================================="
+echo "ALL PAIRS COMPLETE."
+echo "Unwrapped outputs are in: $WORK/diff/<pair>/<pair>.unw"
+echo "Check $WORK/logs/ if any step needs debugging."
+echo "=================================================="
