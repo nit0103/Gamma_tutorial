@@ -1,0 +1,274 @@
+#!/bin/bash
+# ============================================================================
+# MOONIDIH COLLIERY — Sentinel-1A ASCENDING — GAMMA processing
+# Polarization: VV | Subswath: IW2 | Bursts: 4-5 only
+# ALL POSSIBLE PAIRS (3 dates -> 3 pairs) up to PHASE UNWRAPPING
+# Phase unwrapping uses a MANUALLY CHOSEN seed pixel (not auto/default)
+#
+# This version follows the OFFICIAL GAMMA "Sentinel-1 processing with GAMMA
+# software" User's Guide (v2.0, Dec 2021) command names and argument orders
+# wherever the guide gives a full worked example. Two commands used in
+# earlier drafts (multi_S1_TOPS, S1_coreg_TOPS, SLC_copy_S1_TOPS) have been
+# corrected here to the CURRENT (v2.0) program names documented in the
+# guide: multi_look_ScanSAR, ScanSAR_coreg.py, SLC_copy_ScanSAR.
+#
+# Two commands (S1_OPOD_vec, mcf) are used with the standard/common GAMMA
+# argument pattern, but the guide text does NOT print their full argument
+# list, so these two are flagged with a NOTE — run the command with no
+# arguments on your system first to confirm the exact order before running
+# this script for real.
+# ============================================================================
+
+set -e
+
+# ---------------------------------------------------------------------------
+# 0. PROJECT PATHS
+# ---------------------------------------------------------------------------
+PROJ="/g/PhD_Nitish/Moonidih/Moonidih_work/Sentinel gamma"
+S1_DIR="$PROJ/S1A_ASC"
+ORBIT_DIR="$PROJ/ORBIT"
+DEM_SRC_DIR="$PROJ/DEM"
+WORK="$PROJ/GAMMA_processing"
+
+mkdir -p "$WORK"/{DEM,SAFE,SLC,SLC_subset,RSLC,mli,diff,geo,logs}
+
+# ---------------------------------------------------------------------------
+# 1. DATE / FILE MAPPING
+# ---------------------------------------------------------------------------
+declare -A ZIP
+ZIP[20250110]="S1A_IW_SLC__1SDV_20250110T122115_20250110T122142_057382_07100D_B788.zip"
+ZIP[20250122]="S1A_IW_SLC__1SDV_20250122T122114_20250122T122141_057557_0716FE_734A.zip"
+ZIP[20250203]="S1A_IW_SLC__1SDV_20250203T122114_20250203T122141_057732_071DEE_864D.zip"
+
+declare -A ORBIT
+ORBIT[20250110]="S1A_OPER_AUX_POEORB_OPOD_20250130T070638_V20250109T225942_20250111T005942.EOF"
+ORBIT[20250122]="S1A_OPER_AUX_POEORB_OPOD_20250211T070640_V20250121T225942_20250123T005942.EOF"
+ORBIT[20250203]="S1A_OPER_AUX_POEORB_OPOD_20250223T070603_V20250202T225942_20250204T005942.EOF"
+
+DATES=(20250110 20250122 20250203)
+REF=20250122          # middle date -> symmetric baseline (see guide .md for reasoning)
+POL="vv"               # <<< polarization requested
+IW=2
+BURST_FIRST=4
+BURST_LAST=5
+RLKS=10
+AZLKS=2
+
+
+
+
+# Approximate average ground elevation of the Moonidih / Jharia coalfield
+# (Dhanbad district, Jharkhand) in metres above the ellipsoid. Used as a
+# CONSTANT height input to ScanSAR_coreg.py (the guide shows this script
+# accepts either a full .hgt raster OR a single constant height value —
+# see Section 6.2 example: "...20161009.vv.RSLC_tab 5.0 10 2").
+# If you have the precise average height of your AOI from the DEM, replace
+# this number with that value for a slightly more accurate coregistration.
+REF_HEIGHT=200
+
+____________________resolve crash issue________working in chunks_______
+
+
+
+
+export OMP_NUM_THREADS=2
+ulimit -s 65536
+
+________________________
+
+# ---------------------------------------------------------------------------
+# 2. DEM PREPARATION  (Section: DEM import, used by dem_import + gc tools)
+# ---------------------------------------------------------------------------
+# INPUT : DEM_SRC_DIR/moonidih.dem.wgs84.vrt (your existing ISCE-format DEM)
+# OUTPUT: WORK/DEM/moonidih.dem , moonidih.dem_par (GAMMA native format)
+# PURPOSE: GAMMA needs the DEM in its own binary .dem/.dem_par format.
+
+gdal_translate -of GTiff \
+    "$DEM_SRC_DIR/moonidih.dem.wgs84.vrt" \
+    "$WORK/DEM/moonidih_dem.tif"
+
+dem_import "$WORK/DEM/moonidih_dem.tif" \
+    "$WORK/DEM/moonidih.dem" \
+    "$WORK/DEM/moonidih.dem_par" \
+    0 1 - - 0
+
+# ---------------------------------------------------------------------------
+# 3. UNZIP + IMPORT (Guide Section 5.1) — sirf IW2, VV
+# ---------------------------------------------------------------------------
+# The guide's par_S1_SLC example needs the INDIVIDUAL tiff/xml files from
+# inside the unzipped .SAFE folder (NOT the zip itself, and orbits are
+# added SEPARATELY afterwards with S1_OPOD_vec) :
+#
+#   par_S1_SLC */*/s1a-iw1-slc-vv-20141003*-004.tiff \
+#              */*/s1a-iw1-slc-vv-20141003*-004.xml \
+#              */*/*/calibration-s1a-iw1-slc-vv-20141003*-004.xml \
+#              */*/*/noise-s1a-iw1-slc-vv-20141003*-004.xml \
+#              20141003.IW1.slc.par 20141003.IW1.slc 20141003.IW1.slc.TOPS_par
+#
+# OUTPUT: WORK/SLC/<date>/<date>.IW2.slc / .slc.par / .slc.TOPS_par
+# PURPOSE: converts the raw Sentinel-1 product into GAMMA burst-SLC format.
+
+for d in "${DATES[@]}"; do
+    echo ">>> Unzipping $d ..."
+    mkdir -p "$WORK/SAFE/$d"
+    unzip -oq "$S1_DIR/${ZIP[$d]}" -d "$WORK/SAFE/$d" \
+        > "$WORK/logs/unzip_${d}.log" 2>&1
+
+    SAFE_DIR=$(echo "$WORK/SAFE/$d"/*.SAFE)
+    mkdir -p "$WORK/SLC/$d"
+
+    echo ">>> Importing $d (IW${IW}, ${POL}) ..."
+    par_S1_SLC \
+        "$SAFE_DIR"/measurement/s1?-iw${IW}-slc-${POL}-*.tiff \
+        "$SAFE_DIR"/annotation/s1?-iw${IW}-slc-${POL}-*.xml \
+        "$SAFE_DIR"/annotation/calibration/calibration-s1?-iw${IW}-slc-${POL}-*.xml \
+        "$SAFE_DIR"/annotation/calibration/noise-s1?-iw${IW}-slc-${POL}-*.xml \
+        "$WORK/SLC/$d/${d}.IW${IW}.slc.par" \
+        "$WORK/SLC/$d/${d}.IW${IW}.slc" \
+        "$WORK/SLC/$d/${d}.IW${IW}.slc.TOPS_par" \
+        > "$WORK/logs/import_${d}.log" 2>&1
+
+    # -- Add precise orbit state vectors (Guide Section 11) --
+    # NOTE: guide names the program (S1_OPOD_vec) but does not print its
+    # full argument list in the text available to me. Run
+    # "S1_OPOD_vec" with no arguments on your system to confirm order —
+    # the pattern below (slc.par, then the matching .EOF file) is the
+    # standard/common usage.
+    S1_OPOD_vec "$WORK/SLC/$d/${d}.IW${IW}.slc.par" "$ORBIT_DIR/${ORBIT[$d]}" \
+        > "$WORK/logs/orbit_${d}.log" 2>&1
+done
+
+# ---------------------------------------------------------------------------
+# 4. PER-DATE SLC_tab (Guide Section 5.1, single-swath tab = 1 line)
+# ---------------------------------------------------------------------------
+for d in "${DATES[@]}"; do
+    echo "$WORK/SLC/$d/${d}.IW${IW}.slc $WORK/SLC/$d/${d}.IW${IW}.slc.par $WORK/SLC/$d/${d}.IW${IW}.slc.TOPS_par" \
+        > "$WORK/SLC/${d}_IW2_tab"
+done
+
+# ---------------------------------------------------------------------------
+# 5. BURST SUBSETTING — burst 4-5 (Guide Section 5.4.1: BURST_tab + SLC_copy_ScanSAR)
+# ---------------------------------------------------------------------------
+# BURST_tab format confirmed by the guide: one line per swath in the SLC_tab,
+# "first_burst last_burst" (1-based, relative to that burst SLC).
+echo "${BURST_FIRST} ${BURST_LAST}" > "$WORK/burst_tab_IW2"
+
+for d in "${DATES[@]}"; do
+    mkdir -p "$WORK/SLC_subset/$d"
+    echo "$WORK/SLC_subset/$d/${d}.IW${IW}.slc $WORK/SLC_subset/$d/${d}.IW${IW}.slc.par $WORK/SLC_subset/$d/${d}.IW${IW}.slc.TOPS_par" \
+        > "$WORK/SLC_subset/${d}_IW2_tab"
+
+    echo ">>> Extracting burst ${BURST_FIRST}-${BURST_LAST} for $d ..."
+    SLC_copy_ScanSAR "$WORK/SLC/${d}_IW2_tab" \
+        "$WORK/SLC_subset/${d}_IW2_tab" \
+        "$WORK/burst_tab_IW2" \
+        > "$WORK/logs/burstcopy_${d}.log" 2>&1
+done
+
+# ---------------------------------------------------------------------------
+# 6. REFERENCE SCENE — SLC mosaic + MLI mosaic (Guide Sections 5.6, 5.7)
+# ---------------------------------------------------------------------------
+# SLC_mosaic_S1_TOPS  -> reference RSLC (mosaic of burst 4,5 into one image)
+# multi_look_ScanSAR  -> reference MLI (averaged intensity), width comes
+#                        from here for every later command.
+
+SLC_mosaic_S1_TOPS "$WORK/SLC_subset/${REF}_IW2_tab" \
+    "$WORK/RSLC/${REF}.rslc" "$WORK/RSLC/${REF}.rslc.par" \
+    $RLKS $AZLKS \
+    > "$WORK/logs/mosaic_ref.log" 2>&1
+
+multi_look_ScanSAR "$WORK/SLC_subset/${REF}_IW2_tab" \
+    "$WORK/mli/${REF}.mli" "$WORK/mli/${REF}.mli.par" \
+    $RLKS $AZLKS \
+    > "$WORK/logs/mli_ref.log" 2>&1
+
+WIDTH=$(grep range_samples "$WORK/mli/${REF}.mli.par" | awk '{print $2}')
+echo ">>> Reference MLI width = $WIDTH pixels"
+
+echo "$WORK/RSLC/${REF}.rslc $WORK/RSLC/${REF}.rslc.par -" > "$WORK/RSLC/${REF}.RSLC_tab"
+
+# ---------------------------------------------------------------------------
+# 7. COREGISTRATION — ScanSAR_coreg.py (Guide Section 6.2 — automated,
+#    replaces the old S1_coreg_TOPS name)
+# ---------------------------------------------------------------------------
+# Syntax (guide example):
+#   ScanSAR_coreg.py <ref_SLC_tab> <ref_ID> <sec_SLC_tab> <sec_ID> \
+#                     <out_RSLC_tab> <ref_height_or_.hgt> <rlks> <azlks> [options]
+# We use a constant approximate height (REF_HEIGHT) instead of a full
+# radar-geometry .hgt raster — the guide's own example
+# ("...RSLC_tab 5.0 10 2") shows a plain number is accepted here.
+# --cc/--fraction/--ph_stdev are the recommended quality thresholds for the
+# spectral-diversity refinement (guide Section 6.1.4 / 6.2 example values).
+
+for d in "${DATES[@]}"; do
+    if [ "$d" != "$REF" ]; then
+        echo ">>> Coregistering $d -> reference $REF ..."
+        ScanSAR_coreg.py "$WORK/SLC_subset/${REF}_IW2_tab" $REF \
+            "$WORK/SLC_subset/${d}_IW2_tab" $d \
+            "$WORK/RSLC/${d}.RSLC_tab" \
+            $REF_HEIGHT $RLKS $AZLKS \
+            --cc 0.6 --fraction 0.02 --ph_stdev 0.8 --it1 1 --it2 5 \
+            > "$WORK/logs/coreg_${d}.log" 2>&1
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# HELPER: read a 1-line tab file
+# ---------------------------------------------------------------------------
+read_tab() { read -r TAB_SLC TAB_PAR TAB_TOPS < "$1"; }
+
+# ---------------------------------------------------------------------------
+# 8. ALL POSSIBLE PAIRS — 3 dates => 3 pairs
+# ---------------------------------------------------------------------------
+PAIRS=()
+for ((i=0; i<${#DATES[@]}; i++)); do
+    for ((j=i+1; j<${#DATES[@]}; j++)); do
+        PAIRS+=("${DATES[$i]}_${DATES[$j]}")
+    done
+done
+echo ">>> Pairs to process: ${PAIRS[@]}"
+
+# ---------------------------------------------------------------------------
+# 9. LOOP: DIFF INTERFEROGRAM -> ADF FILTER -> COHERENCE MASK
+#    (phase unwrapping is done SEPARATELY in Step 10, interactively)
+# ---------------------------------------------------------------------------
+for pair in "${PAIRS[@]}"; do
+    ref_d=${pair%_*}
+    sec_d=${pair#*_}
+    pairdir="$WORK/diff/${pair}"
+    mkdir -p "$pairdir"
+    echo "=================================================="
+    echo ">>> Processing pair: $ref_d - $sec_d"
+    echo "=================================================="
+
+    read_tab "$WORK/RSLC/${ref_d}.RSLC_tab"; REF_SLC=$TAB_SLC; REF_PAR=$TAB_PAR
+    read_tab "$WORK/RSLC/${sec_d}.RSLC_tab"; SEC_SLC=$TAB_SLC; SEC_PAR=$TAB_PAR
+
+    # (a) simulated topographic phase (Guide Section 6.3)
+    phase_sim_orb "$REF_PAR" "$SEC_PAR" \
+        - "$WORK/DEM/moonidih.dem_par" "$WORK/DEM/moonidih.dem" \
+        "$pairdir/sim_unw" "$REF_PAR" \
+        > "$WORK/logs/simunw_${pair}.log" 2>&1
+
+    # (b) differential interferogram (Guide Section 6.3)
+    SLC_diff_intf "$REF_SLC" "$SEC_SLC" "$REF_PAR" "$SEC_PAR" \
+        - "$pairdir/sim_unw" "$pairdir/${pair}.diff" $RLKS $AZLKS \
+        > "$WORK/logs/diff_${pair}.log" 2>&1
+
+    # (c) adaptive filter + coherence
+    adf "$pairdir/${pair}.diff" "$pairdir/${pair}.diff.adf" \
+        "$pairdir/${pair}.cc" "$WIDTH" 0.4 32 \
+        > "$WORK/logs/adf_${pair}.log" 2>&1
+
+    # (d) coherence mask (areas below 0.3 coherence excluded from unwrapping)
+    rascc_mask "$pairdir/${pair}.cc" "$WORK/mli/${REF}.mli" "$WIDTH" \
+        1 1 0 1 1 0.3 - - - - - "$pairdir/${pair}.mask.bmp" \
+        > "$WORK/logs/mask_${pair}.log" 2>&1
+
+    echo ">>> Ready for unwrapping: $pairdir/${pair}.diff.adf"
+done
+
+echo "=================================================="
+echo "STOP HERE and pick your seed pixel (see Step 10 in the .md guide)"
+echo "before running phase unwrapping for each pair."
+echo "=================================================="
