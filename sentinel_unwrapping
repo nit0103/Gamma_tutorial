@@ -1,0 +1,69 @@
+#!/bin/bash
+# ============================================================================
+# MOONIDIH — Step 10: PHASE UNWRAPPING with a MANUALLY CHOSEN seed pixel
+#
+# Run this AFTER Moonidih_S1A_VV_IW2_B4-5_Prep.sh has finished for all pairs.
+# This script is interactive on purpose (seed pixel choice needs your eyes),
+# so it is kept separate from the main automated pipeline.
+#
+# Usage:
+#   ./Moonidih_S1A_VV_IW2_B4-5_Unwrap.sh <pair> <r_seed> <az_seed>
+#   e.g.  ./Moonidih_S1A_VV_IW2_B4-5_Unwrap.sh 20250110_20250122 340 512
+# ============================================================================
+
+set -e
+
+PROJ="/g/PhD_Nitish/Moonidih/Moonidih_work/Sentinel gamma"
+WORK="$PROJ/GAMMA_processing"
+REF=20250122
+
+PAIR=$1
+R_SEED=$2
+AZ_SEED=$3
+
+if [ -z "$PAIR" ] || [ -z "$R_SEED" ] || [ -z "$AZ_SEED" ]; then
+    echo "Usage: $0 <pair e.g. 20250110_20250122> <range_pixel> <azimuth_pixel>"
+    echo ""
+    echo "-------------------------------------------------------------"
+    echo "HOW TO PICK THE SEED PIXEL (do this BEFORE running this script,"
+    echo "once, using your reference coherence/intensity image):"
+    echo ""
+    echo "  dis2pwr \"\$WORK/diff/<pair>/<pair>.cc\" \"\$WORK/mli/${REF}.mli\" \$WIDTH \$WIDTH"
+    echo ""
+    echo "  -> a coherence + intensity display window opens."
+    echo "  -> pick a pixel that is: (1) HIGH coherence (bright in .cc),"
+    echo "     (2) on STABLE ground (not inside the mining subsidence bowl,"
+    echo "     e.g. a rock outcrop, paved area, or built-up area away from"
+    echo "     the active pit), (3) NOT on water/vegetation (low coherence)."
+    echo "  -> note its RANGE (x, column) and AZIMUTH (y, row) pixel number"
+    echo "     from the display window's coordinate readout."
+    echo "  -> re-run this script with those two numbers."
+    echo "-------------------------------------------------------------"
+    exit 1
+fi
+
+pairdir="$WORK/diff/${PAIR}"
+WIDTH=$(grep range_samples "$WORK/mli/${REF}.mli.par" | awk '{print $2}')
+
+echo ">>> Unwrapping $PAIR with seed pixel (r=$R_SEED, az=$AZ_SEED), width=$WIDTH"
+
+# NOTE on `mcf` syntax: the GAMMA User's Guide text available to me names
+# mcf as the tool used ("Phase filtering (e.g. using adf), phase unwrapping
+# (using mcf or region growing) can be applied as for normal interferograms")
+# but does not print mcf's full argument list. The pattern below is the
+# standard/common GAMMA usage (interferogram, coherence, mask, output,
+# width, mode, then row/column bounds, then the seed point r_init/az_init
+# and its initial phase). BEFORE running for real, type "mcf" with no
+# arguments in your terminal and confirm the exact position of the seed
+# (r_init / az_init) arguments for your installed GAMMA version, and adjust
+# the line below if the order differs.
+
+mcf "$pairdir/${PAIR}.diff.adf" "$pairdir/${PAIR}.cc" \
+    "$pairdir/${PAIR}.mask.bmp" "$pairdir/${PAIR}.unw" \
+    "$WIDTH" 1 0 0 - - 1 1 "$R_SEED" "$AZ_SEED" 0 \
+    > "$WORK/logs/unwrap_${PAIR}.log" 2>&1
+
+echo ">>> DONE: $pairdir/${PAIR}.unw"
+echo ">>> Check $WORK/logs/unwrap_${PAIR}.log if the seed pixel gave a bad result"
+echo ">>> (e.g. isolated unwrapped island, or values discontinuous with"
+echo ">>> neighbours) — pick a different, higher-coherence seed and re-run."
